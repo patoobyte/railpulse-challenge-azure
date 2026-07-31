@@ -79,6 +79,23 @@ def insert_feed_snapshot(cursor, header):
     return cursor.fetchone()[0]
 
 
+def find_existing_snapshot_id(cursor, feed_timestamp):
+    cursor.execute(
+        """
+        SELECT snapshot_id
+        FROM gtfs_rt_feed_snapshots
+        WHERE feed_timestamp = ?
+        """,
+        feed_timestamp,
+    )
+    row = cursor.fetchone()
+
+    if row is None:
+        return None
+
+    return row[0]
+
+
 def insert_trip_update(cursor, snapshot_id, entity):
     trip_update = entity.get("tripUpdate", {})
     trip = trip_update.get("trip", {})
@@ -178,12 +195,24 @@ def ingest_sncb_trip_updates():
     connection_string = get_required_setting("SQL_CONNECTION_STRING")
     feed_data = fetch_sncb_trip_updates()
     entities = feed_data.get("entity", [])
+    feed_timestamp = unix_to_datetime(feed_data.get("header", {}).get("timestamp"))
 
     trip_update_count = 0
     stop_time_update_count = 0
 
     with pyodbc.connect(connection_string) as connection:
         cursor = connection.cursor()
+
+        existing_snapshot_id = find_existing_snapshot_id(cursor, feed_timestamp)
+        if existing_snapshot_id is not None:
+            return {
+                "source": "sncb_gtfs_rt_trip_update",
+                "snapshot_id": existing_snapshot_id,
+                "status": "skipped_duplicate_feed",
+                "trip_updates": 0,
+                "stop_time_updates": 0,
+                "feed_timestamp": feed_timestamp.isoformat(),
+            }
 
         snapshot_id = insert_feed_snapshot(cursor, feed_data.get("header", {}))
 
@@ -204,10 +233,9 @@ def ingest_sncb_trip_updates():
     result = {
         "source": "sncb_gtfs_rt_trip_update",
         "snapshot_id": snapshot_id,
+        "status": "inserted",
         "trip_updates": trip_update_count,
         "stop_time_updates": stop_time_update_count,
-        "feed_timestamp": unix_to_datetime(
-            feed_data.get("header", {}).get("timestamp")
-        ).isoformat(),
+        "feed_timestamp": feed_timestamp.isoformat(),
     }
     return result
