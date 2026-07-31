@@ -2,7 +2,6 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
 import azure.functions as func
 import pyodbc
@@ -11,150 +10,144 @@ import requests
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
 
-IRAIL_LIVEBOARD_URL = "https://api.irail.be/liveboard/"
-BELGIUM_TIMEZONE = ZoneInfo("Europe/Brussels")
-DEFAULT_STATION_ID = "BE.NMBS.008821006"
+SNCB_TRIP_UPDATE_URL = (
+    "https://api-management-opendata-production.azure-api.net"
+    "/api/gtfs/feed/nmbssncb/rt/trip-update/"
+)
 
 
 def unix_to_datetime(value):
+    if value is None:
+        return None
+
+    if isinstance(value, dict):
+        value = value.get("low")
+
+    if value is None:
+        return None
+
     return datetime.fromtimestamp(int(value), tz=timezone.utc).replace(tzinfo=None)
 
 
-def text_to_bit(value):
-    return 1 if str(value) == "1" else 0
+def get_required_setting(name):
+    value = os.environ.get(name)
+    if not value:
+        raise ValueError(f"Missing {name} environment variable.")
+    return value
 
 
-def upsert_station(cursor, station_info):
-    cursor.execute(
-        """
-        IF EXISTS (SELECT 1 FROM live_stations WHERE station_id = ?)
-            UPDATE live_stations
-            SET station_uri = ?,
-                station_name = ?,
-                standard_name = ?,
-                longitude = ?,
-                latitude = ?
-            WHERE station_id = ?
-        ELSE
-            INSERT INTO live_stations (
-                station_id,
-                station_uri,
-                station_name,
-                standard_name,
-                longitude,
-                latitude
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        station_info.get("id"),
-        station_info.get("@id"),
-        station_info.get("name"),
-        station_info.get("standardname"),
-        station_info.get("locationX"),
-        station_info.get("locationY"),
-        station_info.get("id"),
-        station_info.get("id"),
-        station_info.get("@id"),
-        station_info.get("name"),
-        station_info.get("standardname"),
-        station_info.get("locationX"),
-        station_info.get("locationY"),
+def fetch_sncb_trip_updates():
+    partner_key = get_required_setting("BMC_PARTNER_KEY")
+
+    response = requests.get(
+        SNCB_TRIP_UPDATE_URL,
+        params={"format": "json"},
+        headers={
+            "bmc-partner-key": partner_key,
+            "User-Agent": "RailPulse Azure Function",
+        },
+        timeout=30,
     )
 
-
-def upsert_vehicle(cursor, vehicle_info):
-    cursor.execute(
-        """
-        IF EXISTS (SELECT 1 FROM live_vehicles WHERE vehicle_id = ?)
-            UPDATE live_vehicles
-            SET vehicle_uri = ?,
-                vehicle_name = ?,
-                vehicle_shortname = ?,
-                vehicle_number = ?,
-                vehicle_type = ?
-            WHERE vehicle_id = ?
-        ELSE
-            INSERT INTO live_vehicles (
-                vehicle_id,
-                vehicle_uri,
-                vehicle_name,
-                vehicle_shortname,
-                vehicle_number,
-                vehicle_type
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        vehicle_info.get("name"),
-        vehicle_info.get("@id"),
-        vehicle_info.get("name"),
-        vehicle_info.get("shortname"),
-        vehicle_info.get("number"),
-        vehicle_info.get("type"),
-        vehicle_info.get("name"),
-        vehicle_info.get("name"),
-        vehicle_info.get("@id"),
-        vehicle_info.get("name"),
-        vehicle_info.get("shortname"),
-        vehicle_info.get("number"),
-        vehicle_info.get("type"),
-    )
-
-
-def insert_liveboard_record(cursor, snapshot_time, queried_station_id, departure):
-    platform_info = departure.get("platforminfo", {})
-    occupancy = departure.get("occupancy", {})
-    destination_station = departure.get("stationinfo", {})
-    vehicle_info = departure.get("vehicleinfo", {})
-
-    cursor.execute(
-        """
-        INSERT INTO liveboard_records (
-            snapshot_time,
-            queried_station_id,
-            destination_station_id,
-            vehicle_id,
-            departure_api_id,
-            scheduled_time,
-            delay_seconds,
-            platform,
-            platform_is_normal,
-            is_canceled,
-            has_left,
-            is_extra,
-            occupancy,
-            departure_connection
+    if response.status_code >= 400:
+        raise RuntimeError(
+            "SNCB trip-update request failed with "
+            f"status {response.status_code} for {response.url}: "
+            f"{response.text[:1000]}"
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+
+    return response.json()
+
+
+def insert_feed_snapshot(cursor, header):
+    cursor.execute(
+        """
+        INSERT INTO gtfs_rt_feed_snapshots (
+            feed_timestamp,
+            gtfs_realtime_version,
+            incrementality,
+            imported_at
+        )
+        OUTPUT INSERTED.snapshot_id
+        VALUES (?, ?, ?, ?)
         """,
-        snapshot_time,
-        queried_station_id,
-        destination_station.get("id"),
-        vehicle_info.get("name"),
-        departure.get("id"),
+        unix_to_datetime(header.get("timestamp")),
+        header.get("gtfsRealtimeVersion"),
+        header.get("incrementality"),
+        datetime.now(timezone.utc).replace(tzinfo=None),
+    )
+    return cursor.fetchone()[0]
+
+
+def insert_trip_update(cursor, snapshot_id, entity):
+    trip_update = entity.get("tripUpdate", {})
+    trip = trip_update.get("trip", {})
+
+    cursor.execute(
+        """
+        INSERT INTO gtfs_rt_trip_updates (
+            snapshot_id,
+            entity_id,
+            trip_id,
+            start_date,
+            start_time,
+            schedule_relationship,
+            trip_update_timestamp
+        )
+        OUTPUT INSERTED.trip_update_id
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        snapshot_id,
+        entity.get("id"),
+        trip.get("tripId"),
+        trip.get("startDate"),
+        trip.get("startTime"),
+        trip.get("scheduleRelationship"),
+        unix_to_datetime(trip_update.get("timestamp")),
+    )
+    return cursor.fetchone()[0]
+
+
+def insert_stop_time_update(cursor, trip_update_id, stop_update):
+    arrival = stop_update.get("arrival", {})
+    departure = stop_update.get("departure", {})
+
+    cursor.execute(
+        """
+        INSERT INTO gtfs_rt_stop_time_updates (
+            trip_update_id,
+            stop_id,
+            stop_sequence,
+            schedule_relationship,
+            arrival_time,
+            arrival_delay_seconds,
+            departure_time,
+            departure_delay_seconds
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        trip_update_id,
+        stop_update.get("stopId"),
+        stop_update.get("stopSequence"),
+        stop_update.get("scheduleRelationship"),
+        unix_to_datetime(arrival.get("time")),
+        arrival.get("delay"),
         unix_to_datetime(departure.get("time")),
-        int(departure.get("delay", 0)),
-        departure.get("platform"),
-        text_to_bit(platform_info.get("normal")),
-        text_to_bit(departure.get("canceled")),
-        text_to_bit(departure.get("left")),
-        text_to_bit(departure.get("isExtra")),
-        occupancy.get("name"),
-        departure.get("departureConnection"),
+        departure.get("delay"),
     )
 
 
 @app.route(route="ingest_liveboard")
 def ingest_liveboard(req: func.HttpRequest) -> func.HttpResponse:
     try:
-        station_id = req.params.get("id", DEFAULT_STATION_ID)
-        result = ingest_station_liveboard(station_id)
+        result = ingest_sncb_trip_updates()
         return func.HttpResponse(
             json.dumps(result),
             mimetype="application/json",
             status_code=200,
         )
     except Exception as error:
-        logging.exception("Liveboard ingestion failed.")
+        logging.exception("SNCB trip-update ingestion failed.")
         error_response = {
             "error_type": type(error).__name__,
             "error_message": str(error),
@@ -175,64 +168,46 @@ def timer_ingest_liveboard(timer: func.TimerRequest) -> None:
     if timer.past_due:
         logging.info("Timer trigger is running later than scheduled.")
 
-    result = ingest_station_liveboard(DEFAULT_STATION_ID)
+    result = ingest_sncb_trip_updates()
     logging.info("Timer ingestion completed: %s", json.dumps(result))
 
 
-def ingest_station_liveboard(station_id):
-    logging.info("Starting iRail liveboard ingestion.")
+def ingest_sncb_trip_updates():
+    logging.info("Starting SNCB GTFS-RT trip-update ingestion.")
 
-    connection_string = os.environ.get("SQL_CONNECTION_STRING")
-    if not connection_string:
-        raise ValueError("Missing SQL_CONNECTION_STRING environment variable.")
+    connection_string = get_required_setting("SQL_CONNECTION_STRING")
+    feed_data = fetch_sncb_trip_updates()
+    entities = feed_data.get("entity", [])
 
-    belgium_now = datetime.now(BELGIUM_TIMEZONE)
-
-    response = requests.get(
-        IRAIL_LIVEBOARD_URL,
-        params={
-            "id": station_id,
-            "date": belgium_now.strftime("%d%m%y"),
-            "time": belgium_now.strftime("%H%M"),
-            "arrdep": "departure",
-            "format": "json",
-            "lang": "en",
-        },
-        headers={"User-Agent": "RailPulse Azure Function"},
-        timeout=30,
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(
-            "iRail request failed with "
-            f"status {response.status_code} for {response.url}: "
-            f"{response.text[:1000]}"
-        )
-
-    liveboard_data = response.json()
-    snapshot_time = unix_to_datetime(liveboard_data["timestamp"])
-    queried_station_info = liveboard_data["stationinfo"]
-    departures = liveboard_data["departures"]["departure"]
+    trip_update_count = 0
+    stop_time_update_count = 0
 
     with pyodbc.connect(connection_string) as connection:
         cursor = connection.cursor()
 
-        upsert_station(cursor, queried_station_info)
+        snapshot_id = insert_feed_snapshot(cursor, feed_data.get("header", {}))
 
-        for departure in departures:
-            upsert_station(cursor, departure["stationinfo"])
-            upsert_vehicle(cursor, departure["vehicleinfo"])
-            insert_liveboard_record(
-                cursor,
-                snapshot_time,
-                queried_station_info["id"],
-                departure,
-            )
+        for entity in entities:
+            if "tripUpdate" not in entity:
+                continue
+
+            trip_update_id = insert_trip_update(cursor, snapshot_id, entity)
+            trip_update_count += 1
+
+            stop_updates = entity.get("tripUpdate", {}).get("stopTimeUpdate", [])
+            for stop_update in stop_updates:
+                insert_stop_time_update(cursor, trip_update_id, stop_update)
+                stop_time_update_count += 1
 
         connection.commit()
 
     result = {
-        "station_id": station_id,
-        "inserted_records": len(departures),
-        "snapshot_time": snapshot_time.isoformat(),
+        "source": "sncb_gtfs_rt_trip_update",
+        "snapshot_id": snapshot_id,
+        "trip_updates": trip_update_count,
+        "stop_time_updates": stop_time_update_count,
+        "feed_timestamp": unix_to_datetime(
+            feed_data.get("header", {}).get("timestamp")
+        ).isoformat(),
     }
     return result
