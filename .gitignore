@@ -1,6 +1,7 @@
 # local
 local/
 static/
+.vscode/
 local.settings.json
 
 # Byte-compiled / optimized / DLL files
