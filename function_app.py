@@ -62,7 +62,7 @@ def fetch_sncb_trip_updates():
 def insert_feed_snapshot(cursor, header):
     cursor.execute(
         """
-        INSERT INTO gtfs_rt_feed_snapshots (
+        INSERT INTO rt_snapshots (
             feed_timestamp,
             gtfs_realtime_version,
             incrementality,
@@ -83,7 +83,7 @@ def find_existing_snapshot_id(cursor, feed_timestamp):
     cursor.execute(
         """
         SELECT snapshot_id
-        FROM gtfs_rt_feed_snapshots
+        FROM rt_snapshots
         WHERE feed_timestamp = ?
         """,
         feed_timestamp,
@@ -102,7 +102,7 @@ def insert_trip_update(cursor, snapshot_id, entity):
 
     cursor.execute(
         """
-        INSERT INTO gtfs_rt_trip_updates (
+        INSERT INTO rt_trip_updates (
             snapshot_id,
             entity_id,
             trip_id,
@@ -131,7 +131,7 @@ def insert_stop_time_update(cursor, trip_update_id, stop_update):
 
     cursor.execute(
         """
-        INSERT INTO gtfs_rt_stop_time_updates (
+        INSERT INTO rt_stop_time_updates (
             trip_update_id,
             stop_id,
             stop_sequence,
